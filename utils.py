@@ -21,14 +21,14 @@ log = logging.getLogger("vxr-verifier")
 # ---------------------------------------------------------------------------
 
 async def is_staff(bot, interaction: discord.Interaction) -> bool:
-    """Administrator OR holder of the configured staff role."""
+    """Administrator OR holder of any configured staff role."""
     if interaction.user.guild_permissions.administrator:
         return True
     cfg = await bot.db.get_guild_config(interaction.guild.id)
-    if not cfg or not cfg.get("staff_role_id"):
+    if not cfg or not cfg.get("staff_role_ids"):
         return False
-    staff_role = interaction.guild.get_role(cfg["staff_role_id"])
-    return staff_role is not None and staff_role in interaction.user.roles
+    user_role_ids = {r.id for r in interaction.user.roles}
+    return any(rid in user_role_ids for rid in cfg["staff_role_ids"])
 
 
 async def require_staff(bot, interaction: discord.Interaction) -> bool:
@@ -123,15 +123,47 @@ def strip_vxr_prefix(name: str) -> str:
     return name.strip()
 
 
+def _utf16_length(s: str) -> int:
+    """Discord validates nickname length the way JavaScript does: by UTF-16
+    code units, not Unicode codepoints. The stylized 𝑽𝑿𝑹 characters used in
+    the prefixes are in Unicode's supplementary plane, so each one is a
+    surrogate PAIR — 2 units — even though Python's len() counts it as 1.
+    Using len() here under-counts and lets nicknames through that Discord
+    then rejects as too long, especially the staff prefix (it has more of
+    these characters than the member prefix)."""
+    return sum(2 if ord(ch) > 0xFFFF else 1 for ch in s)
+
+
 def build_nickname(base_name: str, prefix: str) -> str:
     base = strip_vxr_prefix(base_name)
-    nick = f"{prefix}{base}"
-    if len(nick) > config.MAX_NICKNAME_LENGTH:
-        # Trim the base name (not the prefix) so the prefix always stays intact.
-        overflow = len(nick) - config.MAX_NICKNAME_LENGTH
-        base = base[: max(1, len(base) - overflow)].rstrip()
-        nick = f"{prefix}{base}"
-    return nick[: config.MAX_NICKNAME_LENGTH]
+    prefix_units = _utf16_length(prefix)
+    max_base_units = config.MAX_NICKNAME_LENGTH - prefix_units
+
+    if max_base_units <= 0:
+        # The prefix alone is already at/over Discord's limit — there's no
+        # room for any name at all. Truncate the prefix itself as a last
+        # resort rather than producing something Discord will reject outright.
+        truncated = []
+        units = 0
+        for ch in prefix:
+            w = 2 if ord(ch) > 0xFFFF else 1
+            if units + w > config.MAX_NICKNAME_LENGTH:
+                break
+            truncated.append(ch)
+            units += w
+        return "".join(truncated)
+
+    trimmed_chars = []
+    units = 0
+    for ch in base:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if units + w > max_base_units:
+            break
+        trimmed_chars.append(ch)
+        units += w
+    trimmed_base = "".join(trimmed_chars).rstrip()
+
+    return f"{prefix}{trimmed_base}"
 
 
 async def safe_set_nickname(member: discord.Member, new_nick: str, reason: str) -> tuple[bool, str]:
@@ -154,9 +186,18 @@ async def safe_set_nickname(member: discord.Member, new_nick: str, reason: str) 
         return False, f"Discord API error while changing nickname: {e}"
 
 
-async def apply_member_prefix(member: discord.Member) -> tuple[bool, str]:
-    new_nick = build_nickname(member.display_name, config.VXR_MEMBER_PREFIX)
-    return await safe_set_nickname(member, new_nick, "Verification accepted — applying VXR prefix")
+def sanitize_ingame_name(name: str) -> str:
+    """Cleans up a free-text application answer before it's used in a nickname
+    (collapses newlines/extra whitespace from the modal field, trims edges)."""
+    return " ".join(name.split())
+
+
+async def apply_member_prefix(member: discord.Member, ingame_name: Optional[str] = None) -> tuple[bool, str]:
+    base = sanitize_ingame_name(ingame_name) if ingame_name else ""
+    if not base:
+        base = member.display_name  # fallback: no in-game name on file (e.g. /verify with no application)
+    new_nick = build_nickname(base, config.VXR_MEMBER_PREFIX)
+    return await safe_set_nickname(member, new_nick, "Verification accepted — applying VXR prefix with in-game name")
 
 
 async def apply_staff_prefix(member: discord.Member) -> tuple[bool, str]:
@@ -315,7 +356,11 @@ async def process_acceptance(
     if not ok:
         warnings.append(f"Member role: {msg}")
 
-    nick_ok, nick_msg = await apply_member_prefix(member)
+    ingame_name = None
+    if application and application.get("answers"):
+        ingame_name = application["answers"].get("q0")  # q0 is always the in-game-name question by convention
+
+    nick_ok, nick_msg = await apply_member_prefix(member, ingame_name=ingame_name)
     if not nick_ok:
         warnings.append(f"Nickname: {nick_msg}")
 
