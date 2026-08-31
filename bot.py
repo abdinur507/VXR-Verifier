@@ -65,6 +65,13 @@ class VXRVerifier(commands.Bot):
 
         if config.GUILD_ID:
             guild_obj = discord.Object(id=int(config.GUILD_ID))
+
+            # Wipe any leftover GLOBAL commands from a previous run so they
+            # can't coexist with the guild-scoped ones below and show up
+            # twice in Discord.
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+
             self.tree.copy_global_to(guild=guild_obj)
             synced = await self.tree.sync(guild=guild_obj)
             log.info("Synced %d command(s) to guild %s (fast dev sync).", len(synced), config.GUILD_ID)
