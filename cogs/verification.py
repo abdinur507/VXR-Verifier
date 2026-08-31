@@ -79,7 +79,7 @@ class VerificationModal(discord.ui.Modal, title="JAMAAHIRTA GANG Verification"):
             )
             return
 
-                answers = {f"q{i}": field.value for i, field in enumerate(self.field_map)}
+        answers = {f"q{i}": field.value for i, field in enumerate(self.field_map)}
         application_id = await bot.db.create_application(guild.id, interaction.user.id, answers)
         application = await bot.db.get_application(application_id)
 
