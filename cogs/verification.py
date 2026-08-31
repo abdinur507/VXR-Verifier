@@ -79,14 +79,25 @@ class VerificationModal(discord.ui.Modal, title="JAMAAHIRTA GANG Verification"):
             )
             return
 
-        answers = {f"q{i}": field.value for i, field in enumerate(self.field_map)}
+                answers = {f"q{i}": field.value for i, field in enumerate(self.field_map)}
         application_id = await bot.db.create_application(guild.id, interaction.user.id, answers)
         application = await bot.db.get_application(application_id)
 
         review_view = ReviewView(application_id)
         embed = utils.build_review_embed(interaction.user, application, cfg["questions"])
+
+        staff_role_ids = cfg.get("staff_role_ids", [])
+        ping_content = None
+        if staff_role_ids:
+            ping_content = "🔔 " + " ".join(f"<@&{rid}>" for rid in staff_role_ids) + " — new application to review!"
+
         try:
-            msg = await review_channel.send(embed=embed, view=review_view)
+            msg = await review_channel.send(
+                content=ping_content,
+                embed=embed,
+                view=review_view,
+                allowed_mentions=discord.AllowedMentions(roles=True, everyone=False, users=False),
+            )
             await bot.db.set_application_message(application_id, msg.id)
         except discord.Forbidden:
             await interaction.response.send_message(
