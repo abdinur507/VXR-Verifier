@@ -1,0 +1,186 @@
+"""
+Centralized leadership/staff role tier (config.STAFF_ROLE_TABLE):
+
+  - on_member_update: automatically re-syncs a member's nickname prefix the
+    moment one of their configured roles changes (promotion, demotion, role
+    removal) — no manual command needed.
+  - /staffroles           - shows every configured leadership/staff role,
+                            its priority, its prefix, and its permissions.
+  - /prefixpreview <user> - shows what prefix a member would receive right
+                            now, WITHOUT changing anything.
+  - /prefixsync           - bulk re-applies the correct prefix to every
+                            member currently holding a configured role.
+"""
+
+import asyncio
+import logging
+
+import discord
+from discord import app_commands
+from discord.ext import commands
+
+import config
+import utils
+
+log = logging.getLogger("vxr-verifier")
+
+
+class StaffRolesCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+
+    # ------------------------------------------------------------------
+    # Automatic prefix sync on role change
+    # ------------------------------------------------------------------
+    @commands.Cog.listener()
+    async def on_member_update(self, before: discord.Member, after: discord.Member):
+        if before.roles == after.roles:
+            return  # nothing changed — most on_member_update fires are unrelated (status, etc.)
+
+        before_entry = utils.get_highest_staff_role(before)
+        after_entry = utils.get_highest_staff_role(after)
+
+        # Only act if which configured role applies actually changed —
+        # avoids re-writing the same nickname on every unrelated role edit.
+        before_role_id = before_entry.get("role_id") if before_entry else None
+        after_role_id = after_entry.get("role_id") if after_entry else None
+        if before_role_id == after_role_id:
+            return
+
+        guild = after.guild
+
+        if after_entry is not None:
+            ok, msg = await utils.apply_configured_prefix(after)
+            await self.bot.db.set_staff_prefix_flag(guild.id, after.id, True)
+            action = f"promoted/updated to {after_entry['name']}"
+        else:
+            # Lost their last configured role — fall back to the plain
+            # member prefix (only meaningful if they're actually verified;
+            # apply_member_prefix is a no-op-safe call otherwise since it
+            # just renames using their current display name).
+            ok, msg = await utils.apply_member_prefix(after)
+            await self.bot.db.set_staff_prefix_flag(guild.id, after.id, False)
+            action = "lost their configured staff/leadership role"
+
+        log_embed = discord.Embed(title="🏷️ Prefix Auto-Synced", color=config.COLOR_INFO)
+        log_embed.add_field(name="Member", value=f"{after.mention} (`{after.id}`)", inline=False)
+        log_embed.add_field(name="Change", value=action, inline=True)
+        log_embed.add_field(name="Result", value="✅ Applied" if ok else f"⚠️ {msg}", inline=True)
+        await utils.send_log(self.bot, guild, log_embed)
+
+    # ------------------------------------------------------------------
+    # /staffroles
+    # ------------------------------------------------------------------
+    @app_commands.command(name="staffroles", description="Show every configured leadership/staff role and its prefix")
+    async def staffroles(self, interaction: discord.Interaction):
+        if not await utils.require_staff(self.bot, interaction):
+            return
+
+        guild = interaction.guild
+        entries = sorted(
+            ({"role_id": rid, **e} for rid, e in config.STAFF_ROLE_TABLE.items()),
+            key=lambda e: e["priority"],
+        )
+
+        embed = discord.Embed(title="👑 Staff & Leadership Roles", color=config.COLOR_INFO)
+        lines = []
+        for e in entries:
+            role = guild.get_role(e["role_id"])
+            role_text = role.mention if role else f"`{e['role_id']}` (not found in this server)"
+            perms = "".join([
+                "R" if e["review"] else "-",
+                "A" if e["accept"] else "-",
+                "D" if e["deny"] else "-",
+                "M" if e["manual_verify"] else "-",
+            ])
+            lines.append(f"**#{e['priority']}** {role_text} — {e['prefix'].strip()} — perms `{perms}`")
+        # Discord embed field values cap at 1024 chars — split into chunks if needed.
+        chunk = []
+        length = 0
+        chunk_num = 1
+        for line in lines:
+            if length + len(line) + 1 > 1024:
+                embed.add_field(name=f"Roles ({chunk_num})", value="\n".join(chunk), inline=False)
+                chunk, length = [], 0
+                chunk_num += 1
+            chunk.append(line)
+            length += len(line) + 1
+        if chunk:
+            embed.add_field(name=f"Roles ({chunk_num})" if chunk_num > 1 else "Roles", value="\n".join(chunk), inline=False)
+        embed.set_footer(text="R=Review  A=Accept  D=Deny  M=Manual verify")
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ------------------------------------------------------------------
+    # /prefixpreview
+    # ------------------------------------------------------------------
+    @app_commands.command(name="prefixpreview", description="Preview the prefix a member would receive — changes nothing")
+    @app_commands.describe(user="The member to check")
+    async def prefixpreview(self, interaction: discord.Interaction, user: discord.Member):
+        if not await utils.require_staff(self.bot, interaction):
+            return
+
+        entry = utils.get_highest_staff_role(user)
+        base = utils.strip_known_prefix(user.display_name)
+
+        if entry is None:
+            await interaction.response.send_message(
+                f"{user.mention} doesn't hold any configured leadership/staff role — "
+                f"they'd keep the normal `{config.VXR_MEMBER_PREFIX.strip()}` member prefix.",
+                ephemeral=True,
+            )
+            return
+
+        preview_nick = utils.build_nickname(base, entry["prefix"])
+        await interaction.response.send_message(
+            f"{user.mention} would receive the **{entry['name']}** prefix "
+            f"(priority #{entry['priority']}):\n`{preview_nick}`",
+            ephemeral=True,
+        )
+
+    # ------------------------------------------------------------------
+    # /prefixsync
+    # ------------------------------------------------------------------
+    @app_commands.command(name="prefixsync", description="Re-apply the correct prefix to every member with a configured role")
+    @app_commands.checks.has_permissions(administrator=True)
+    async def prefixsync(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        guild = interaction.guild
+
+        targets = [m for m in guild.members if utils.get_highest_staff_role(m) is not None]
+        updated, skipped, failed = 0, 0, 0
+        failures: list[str] = []
+
+        for member in targets:
+            ok, msg = await utils.apply_configured_prefix(member)
+            if ok:
+                if msg == "Nickname already correct.":
+                    skipped += 1
+                else:
+                    updated += 1
+                await self.bot.db.set_staff_prefix_flag(guild.id, member.id, True)
+            else:
+                failed += 1
+                failures.append(f"{member.mention}: {msg}")
+            await asyncio.sleep(0.3)  # gentle pacing to stay well clear of nickname rate limits
+
+        embed = discord.Embed(title="🔄 Prefix Sync Complete", color=config.COLOR_INFO)
+        embed.add_field(name="Checked", value=str(len(targets)), inline=True)
+        embed.add_field(name="Updated", value=str(updated), inline=True)
+        embed.add_field(name="Already correct", value=str(skipped), inline=True)
+        embed.add_field(name="Failed", value=str(failed), inline=True)
+        if failures:
+            embed.add_field(name="⚠️ Failures", value="\n".join(failures[:10])[:1024], inline=False)
+
+        await utils.send_log(self.bot, guild, embed)
+        await interaction.followup.send(embed=embed)
+
+    @prefixsync.error
+    async def prefixsync_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError):
+        if isinstance(error, app_commands.MissingPermissions):
+            await interaction.response.send_message(
+                "❌ You need Administrator permission to run a bulk prefix sync.", ephemeral=True
+            )
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(StaffRolesCog(bot))

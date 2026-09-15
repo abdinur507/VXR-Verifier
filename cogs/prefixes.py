@@ -1,6 +1,11 @@
 """
-/staffprefix <user>        - apply the 『𝑽𝑿𝑹・𝑺𝒕𝒂𝒇𝒇』 nickname prefix
+/staffprefix <user>        - apply the correct staff/leadership nickname
+                              prefix (auto-detected from config.STAFF_ROLE_TABLE
+                              if the target holds one of those roles, otherwise
+                              falls back to the legacy 『𝑽𝑿𝑹・𝑺𝒕𝒂𝒇𝒇』 prefix)
 /removestaffprefix <user>  - remove it and restore the normal 『𝑽𝑿𝑹』 prefix
+
+See also cogs/staffroles.py for /staffroles, /prefixpreview and /prefixsync.
 """
 
 import discord
@@ -26,17 +31,25 @@ class PrefixesCog(commands.Cog):
             await interaction.response.send_message("Run `/setupverification` first.", ephemeral=True)
             return
 
+        # Prefer the centralized leadership/staff table — gives Owner/Boss/etc.
+        # their own distinct prefix instead of forcing the generic staff one.
+        leadership_entry = utils.get_highest_staff_role(user)
+
         staff_role = interaction.guild.get_role(cfg["staff_role_id"]) if cfg.get("staff_role_id") else None
-        is_target_staff = user.guild_permissions.administrator or (staff_role and staff_role in user.roles)
+        is_legacy_staff = staff_role and staff_role in user.roles
+        is_target_staff = user.guild_permissions.administrator or leadership_entry is not None or is_legacy_staff
         if not is_target_staff:
             await interaction.response.send_message(
-                f"{user.mention} doesn't hold the configured staff role, so they aren't eligible "
-                "for the Staff VXR prefix.",
+                f"{user.mention} doesn't hold a configured staff/leadership role, so they aren't "
+                "eligible for a staff prefix.",
                 ephemeral=True,
             )
             return
 
-        ok, msg = await utils.apply_staff_prefix(user)
+        if leadership_entry is not None:
+            ok, msg = await utils.apply_configured_prefix(user)
+        else:
+            ok, msg = await utils.apply_staff_prefix(user)
         if ok:
             await self.bot.db.set_staff_prefix_flag(interaction.guild.id, user.id, True)
             log_embed = discord.Embed(title="🏷️ Staff Prefix Applied", color=config.COLOR_INFO)

@@ -187,6 +187,20 @@ class Database:
             results.append(data)
         return results
 
+    async def list_applications_by_user(self, guild_id: int, user_id: int, limit: int = 10) -> list[dict]:
+        cur = await self._conn.execute(
+            "SELECT * FROM applications WHERE guild_id = ? AND user_id = ? "
+            "ORDER BY id DESC LIMIT ?",
+            (guild_id, user_id, limit),
+        )
+        rows = await cur.fetchall()
+        results = []
+        for row in rows:
+            data = dict(row)
+            data["answers"] = json.loads(data["answers"])
+            results.append(data)
+        return results
+
     async def finalize_application(
         self,
         application_id: int,

@@ -18,9 +18,34 @@ class ApplicationsCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="applications", description="Show pending verification applications")
-    async def applications(self, interaction: discord.Interaction):
+    @app_commands.command(name="applications", description="Show pending applications, or one member's application history")
+    @app_commands.describe(user="Optional — show this member's application history instead of the pending queue")
+    async def applications(self, interaction: discord.Interaction, user: discord.Member = None):
         if not await utils.require_staff(self.bot, interaction):
+            return
+
+        if user is not None:
+            history = await self.bot.db.list_applications_by_user(interaction.guild.id, user.id)
+            if not history:
+                await interaction.response.send_message(
+                    f"{user.mention} has no application history.", ephemeral=True
+                )
+                return
+
+            embed = discord.Embed(
+                title=f"📜 Application History — {user.display_name}",
+                color=config.COLOR_INFO,
+            )
+            embed.set_thumbnail(url=user.display_avatar.url)
+            for app in history[:25]:
+                first_answer = next(iter(app["answers"].values()), "-")
+                status_emoji = config.STATUS_EMOJI.get(app["status"], "")
+                reviewer = f" — reviewed by <@{app['reviewer_id']}>" if app.get("reviewer_id") else ""
+                value = f"{status_emoji} **{app['status'].capitalize()}**{reviewer}\n\"{first_answer[:80]}\""
+                if app.get("deny_reason"):
+                    value += f"\nReason: {app['deny_reason'][:150]}"
+                embed.add_field(name=utils.format_app_id(app["id"]), value=value, inline=False)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
         pending = await self.bot.db.list_pending_applications(interaction.guild.id)

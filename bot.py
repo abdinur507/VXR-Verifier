@@ -33,6 +33,8 @@ EXTENSIONS = (
     "cogs.moderation",
     "cogs.prefixes",
     "cogs.admin",
+    "cogs.staffroles",
+    "cogs.health",
 )
 
 
@@ -66,15 +68,17 @@ class VXRVerifier(commands.Bot):
         if config.GUILD_ID:
             guild_obj = discord.Object(id=int(config.GUILD_ID))
 
-            # Wipe any leftover GLOBAL commands from a previous run so they
-            # can't coexist with the guild-scoped ones below and show up
-            # twice in Discord.
-            self.tree.clear_commands(guild=None)
-            await self.tree.sync()
-
+            # Copy the in-memory global commands to the guild FIRST, sync
+            # them there, and only THEN wipe the global copy from Discord.
+            # (Clearing before copying would copy nothing, and leaving the
+            # global copy in place is what causes commands to show twice.)
             self.tree.copy_global_to(guild=guild_obj)
             synced = await self.tree.sync(guild=guild_obj)
             log.info("Synced %d command(s) to guild %s (fast dev sync).", len(synced), config.GUILD_ID)
+
+            self.tree.clear_commands(guild=None)
+            await self.tree.sync()
+            log.info("Cleared global commands so they can't duplicate the guild-scoped ones.")
         else:
             synced = await self.tree.sync()
             log.info("Synced %d command(s) globally.", len(synced))

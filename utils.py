@@ -20,22 +20,45 @@ log = logging.getLogger("vxr-verifier")
 # Permissions
 # ---------------------------------------------------------------------------
 
+def get_highest_staff_role(member: discord.Member) -> Optional[dict]:
+    """Returns the entry (from config.STAFF_ROLE_TABLE) for the member's
+    highest-priority configured leadership/staff role, or None if they hold
+    none of them. Includes "role_id" in the returned dict for convenience."""
+    member_role_ids = {r.id for r in member.roles}
+    best = None
+    for role_id, entry in config.STAFF_ROLE_TABLE.items():
+        if role_id in member_role_ids:
+            if best is None or entry["priority"] < best["priority"]:
+                best = {**entry, "role_id": role_id}
+    return best
+
+
 async def is_staff(bot, interaction: discord.Interaction) -> bool:
-    """Administrator OR holder of any configured staff role."""
+    """Administrator OR holder of a centrally-configured leadership/staff
+    role (config.STAFF_ROLE_TABLE) OR the guild's legacy configurable
+    staff_role_id. All permission checks (buttons, modals, slash commands)
+    route through this single function so behaviour never drifts."""
     if interaction.user.guild_permissions.administrator:
         return True
+
+    entry = get_highest_staff_role(interaction.user)
+    if entry is not None and entry.get("review"):
+        return True
+
     cfg = await bot.db.get_guild_config(interaction.guild.id)
-    if not cfg or not cfg.get("staff_role_ids"):
-        return False
-    user_role_ids = {r.id for r in interaction.user.roles}
-    return any(rid in user_role_ids for rid in cfg["staff_role_ids"])
+    if cfg and cfg.get("staff_role_id"):
+        user_role_ids = {r.id for r in interaction.user.roles}
+        if cfg["staff_role_id"] in user_role_ids:
+            return True
+
+    return False
 
 
 async def require_staff(bot, interaction: discord.Interaction) -> bool:
     """Sends the standard denial message and returns False if not staff."""
     if await is_staff(bot, interaction):
         return True
-    message = "❌ You do not have permission to review applications."
+    message = "❌ You do not have permission to review verification applications."
     if interaction.response.is_done():
         await interaction.followup.send(message, ephemeral=True)
     else:
@@ -115,12 +138,32 @@ async def safe_remove_role(guild: discord.Guild, member: discord.Member, role_id
 # VXR nickname / prefix management
 # ---------------------------------------------------------------------------
 
-def strip_vxr_prefix(name: str) -> str:
-    """Removes a leading VXR or VXR-Staff prefix if present, whitespace-safe."""
-    for prefix in (config.VXR_STAFF_PREFIX, config.VXR_MEMBER_PREFIX):
+def all_known_prefixes() -> list[str]:
+    """Every prefix the bot might ever apply: the plain member prefix, plus
+    every (deduplicated) prefix in config.STAFF_ROLE_TABLE. Sorted longest
+    first so a longer prefix always matches before a shorter one that
+    happens to be its own prefix (e.g. avoids a partial match)."""
+    prefixes = {config.VXR_MEMBER_PREFIX, config.VXR_STAFF_PREFIX}
+    for entry in config.STAFF_ROLE_TABLE.values():
+        prefixes.add(entry["prefix"])
+    return sorted(prefixes, key=len, reverse=True)
+
+
+def strip_known_prefix(name: str) -> str:
+    """Removes any ONE leading configured prefix (member, legacy staff, or
+    any leadership prefix) if present, whitespace-safe. This is what stops
+    prefixes from stacking when a member's rank changes — e.g. it correctly
+    strips a stale 『𝑨𝑫𝑴𝑰𝑵』 prefix before a new 『𝑩𝑶𝑺𝑺』 one is applied,
+    instead of producing 『𝑩𝑶𝑺𝑺』 『𝑨𝑫𝑴𝑰𝑵』 Name (which would also eat into
+    the character budget and chop the real name)."""
+    for prefix in all_known_prefixes():
         if name.startswith(prefix):
             return name[len(prefix):].strip()
     return name.strip()
+
+
+# Backwards-compatible alias — old name, same (now smarter) behavior.
+strip_vxr_prefix = strip_known_prefix
 
 
 def _utf16_length(s: str) -> int:
@@ -134,8 +177,44 @@ def _utf16_length(s: str) -> int:
     return sum(2 if ord(ch) > 0xFFFF else 1 for ch in s)
 
 
+def _hard_truncate_units(text: str, max_units: int) -> str:
+    """Last-resort character-level trim (used only when not even a single
+    whole word fits in the remaining space)."""
+    chars = []
+    units = 0
+    for ch in text:
+        w = 2 if ord(ch) > 0xFFFF else 1
+        if units + w > max_units:
+            break
+        chars.append(ch)
+        units += w
+    return "".join(chars).rstrip()
+
+
+def _trim_to_units_word_safe(text: str, max_units: int) -> str:
+    """Fits `text` into `max_units` UTF-16 units WITHOUT cutting a word in
+    half. Drops whole trailing words one at a time until what's left fits.
+    Only falls back to a mid-word character trim if a single word is on its
+    own longer than the entire budget (nothing else can be done then)."""
+    words = text.split(" ")
+    kept = []
+    units = 0
+    for w in words:
+        w_units = _utf16_length(w)
+        sep_units = 1 if kept else 0
+        if units + sep_units + w_units > max_units:
+            break
+        kept.append(w)
+        units += sep_units + w_units
+
+    if kept:
+        return " ".join(kept)
+    # Not even the first word fits — nothing left to do but trim it.
+    return _hard_truncate_units(text, max_units)
+
+
 def build_nickname(base_name: str, prefix: str) -> str:
-    base = strip_vxr_prefix(base_name)
+    base = strip_known_prefix(base_name)
     prefix_units = _utf16_length(prefix)
     max_base_units = config.MAX_NICKNAME_LENGTH - prefix_units
 
@@ -143,26 +222,15 @@ def build_nickname(base_name: str, prefix: str) -> str:
         # The prefix alone is already at/over Discord's limit — there's no
         # room for any name at all. Truncate the prefix itself as a last
         # resort rather than producing something Discord will reject outright.
-        truncated = []
-        units = 0
-        for ch in prefix:
-            w = 2 if ord(ch) > 0xFFFF else 1
-            if units + w > config.MAX_NICKNAME_LENGTH:
-                break
-            truncated.append(ch)
-            units += w
-        return "".join(truncated)
+        return _hard_truncate_units(prefix, config.MAX_NICKNAME_LENGTH)
 
-    trimmed_chars = []
-    units = 0
-    for ch in base:
-        w = 2 if ord(ch) > 0xFFFF else 1
-        if units + w > max_base_units:
-            break
-        trimmed_chars.append(ch)
-        units += w
-    trimmed_base = "".join(trimmed_chars).rstrip()
+    if _utf16_length(base) <= max_base_units:
+        # Full name fits — nothing is ever trimmed in this (common) case.
+        return f"{prefix}{base}"
 
+    # Doesn't fit alongside the prefix: trim whole words from the end
+    # rather than chopping the name itself in half mid-word.
+    trimmed_base = _trim_to_units_word_safe(base, max_base_units)
     return f"{prefix}{trimmed_base}"
 
 
@@ -203,6 +271,27 @@ async def apply_member_prefix(member: discord.Member, ingame_name: Optional[str]
 async def apply_staff_prefix(member: discord.Member) -> tuple[bool, str]:
     new_nick = build_nickname(member.display_name, config.VXR_STAFF_PREFIX)
     return await safe_set_nickname(member, new_nick, "Staff VXR prefix applied")
+
+
+async def apply_configured_prefix(member: discord.Member, base_name: Optional[str] = None) -> tuple[bool, str]:
+    """Auto-detects the member's highest-priority role in
+    config.STAFF_ROLE_TABLE and applies the matching prefix (Owner, Co-Owner,
+    Boss, Underboss I/II, or the existing staff prefix). If the member holds
+    none of those roles, this does nothing and reports so — it never removes
+    an unrelated prefix on its own, callers that want that call
+    clear_vxr_prefix / apply_member_prefix explicitly instead."""
+    entry = get_highest_staff_role(member)
+    if entry is None:
+        return True, "No configured leadership/staff role — nothing to apply."
+
+    base = sanitize_ingame_name(base_name) if base_name else ""
+    if not base:
+        base = strip_known_prefix(member.display_name)
+    if not base:
+        base = member.name
+
+    new_nick = build_nickname(base, entry["prefix"])
+    return await safe_set_nickname(member, new_nick, f"Auto prefix sync — {entry['name']}")
 
 
 async def clear_vxr_prefix(member: discord.Member) -> tuple[bool, str]:
@@ -363,6 +452,16 @@ async def process_acceptance(
     nick_ok, nick_msg = await apply_member_prefix(member, ingame_name=ingame_name)
     if not nick_ok:
         warnings.append(f"Nickname: {nick_msg}")
+
+    # If they already hold a configured leadership/staff role (e.g. an admin
+    # applying for verification on an alt-less setup), the staff prefix
+    # takes priority over the plain member prefix just applied above.
+    staff_entry = get_highest_staff_role(member)
+    if staff_entry is not None:
+        staff_ok, staff_msg = await apply_configured_prefix(member, base_name=ingame_name)
+        if not staff_ok:
+            warnings.append(f"Staff prefix: {staff_msg}")
+        await bot.db.set_staff_prefix_flag(guild.id, member.id, True)
 
     await bot.db.mark_verified(guild.id, member.id)
 

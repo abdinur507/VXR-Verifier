@@ -86,10 +86,10 @@ class VerificationModal(discord.ui.Modal, title="JAMAAHIRTA GANG Verification"):
         review_view = ReviewView(application_id)
         embed = utils.build_review_embed(interaction.user, application, cfg["questions"])
 
-        staff_role_ids = cfg.get("staff_role_ids", [])
+        staff_role_id = cfg.get("staff_role_id")
         ping_content = None
-        if staff_role_ids:
-            ping_content = "🔔 " + " ".join(f"<@&{rid}>" for rid in staff_role_ids) + " — new application to review!"
+        if staff_role_id:
+            ping_content = f"🔔 <@&{staff_role_id}> — new application to review!"
 
         try:
             msg = await review_channel.send(
@@ -296,8 +296,15 @@ class VerificationCog(commands.Cog):
             ok1, msg1 = await utils.safe_add_role(guild, member, cfg.get("verified_role_id"), "Rejoin — permanent verification")
             ok2, msg2 = await utils.safe_add_role(guild, member, cfg.get("member_role_id"), "Rejoin — permanent verification")
             nick_ok, nick_msg = await utils.apply_member_prefix(member)
-            if await self.bot.db.has_staff_prefix(guild.id, member.id):
-                await utils.apply_staff_prefix(member)
+            # Re-derive the staff/leadership prefix from their CURRENT roles
+            # (not just the old flag) so a rejoining admin/leader gets the
+            # correct prefix even if their rank changed while they were gone.
+            staff_entry = utils.get_highest_staff_role(member)
+            if staff_entry is not None:
+                await utils.apply_configured_prefix(member)
+                await self.bot.db.set_staff_prefix_flag(guild.id, member.id, True)
+            elif await self.bot.db.has_staff_prefix(guild.id, member.id):
+                await self.bot.db.set_staff_prefix_flag(guild.id, member.id, False)
 
             log_embed = discord.Embed(
                 title="🔁 Returning Member — Verification Restored",
